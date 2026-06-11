@@ -1,314 +1,466 @@
-/**
- * trx_uart_controller_tb.sv - Lab 5 testbench
- *
- * Five scenarios:
- *   1. TX 1x1 mode             (Lab 4 regression, sw[15]=0)
- *   2. TX 32x32 mode           (Lab 4 regression, sw[15]=0)
- *   3. TX gated in RX mode     (sw[15]=1, BTNC press must NOT start a transmission)
- *   4. RX happy path           (sw[15]=1, send "{R032,C016,V255}")
- *   5. RX malformed            (sw[15]=1, send "{R032,X016,V255}" - parser rejects)
- *
- * All scenarios use the scaled-down baud / debounce / latch parameters so the
- * full run fits in a few milliseconds of simulation time.
- */
+
 
 `timescale 1ns / 1ps
 
 module trx_uart_controller_tb;
 
-    // ----------------------------------------------------------------
-    // Sim-scaled parameter values (overridden via defparam below)
-    // ----------------------------------------------------------------
-    localparam int CLK_PERIOD_NS       = 10;
-    localparam int SIM_BAUD_DIVISOR    = 8;
-    localparam int SIM_DEBOUNCE_CYCLES = 4;
-    localparam int SIM_LATCH_CYCLES    = 16;
-    localparam int SIM_DELAY_1_CYCLES  = 6;
-    localparam int SIM_DELAY_2_CYCLES  = 10;
-    localparam int SIM_DELAY_3_CYCLES  = 14;
-    localparam int SIM_DIGIT_PERIOD    = 8;
+    // -------------------------------------------------------------------------
+    // Timing constants
+    // -------------------------------------------------------------------------
+    localparam int CLK_PERIOD_NS     = 10;
+    localparam int UART_BIT_CYCLES   = 1736;            // real 57600 baud
+    localparam int HALF_BIT_CYCLES   = UART_BIT_CYCLES / 2;
+    localparam int RX_RESULT_TIMEOUT = 50_000;
+    localparam int TX_START_TIMEOUT  = 100_000;         // covers button hold + first TX byte
+    localparam int TX_IDLE_TIMEOUT   = 200_000;
+    localparam int BTN_HOLD_CYCLES   = 50;              // > scaled latch threshold
 
-    // ----------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // DUT signals
-    // ----------------------------------------------------------------
+    // -------------------------------------------------------------------------
     logic        clk;
     logic        rst_n;
     logic [15:0] sw;
     logic        center_btn;
-    logic        rx_in_drv;          // TB drives this -> dut.rx_in
+    logic        rx_in_drv;
     logic        uart_tx;
     logic [15:0] led;
     logic [7:0]  an;
     logic [6:0]  segment;
     logic        dp;
 
-    byte         rx_byte;
-    byte         delimiter_byte;
-
     trx_uart_controller dut (
-        .clk(clk),
-        .rst_n(rst_n),
-        .sw(sw),
-        .center_btn(center_btn),
-        .rx_in(rx_in_drv),
-        .uart_tx(uart_tx),
-        .led(led),
-        .an(an),
-        .segment(segment),
-        .dp(dp)
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .sw         (sw),
+        .center_btn (center_btn),
+        .rx_in      (rx_in_drv),
+        .uart_tx    (uart_tx),
+        .led        (led),
+        .an         (an),
+        .segment    (segment),
+        .dp         (dp)
     );
 
-    // Scale all the slow real-HW thresholds down for fast simulation.
-    defparam dut.uart_phy_inst.DIVISOR             = SIM_BAUD_DIVISOR;
-    defparam dut.rx_phy_inst.BAUD_DIVISOR          = SIM_BAUD_DIVISOR;
-    defparam dut.rx_phy_inst.HALF_BAUD             = SIM_BAUD_DIVISOR / 2;
-    defparam dut.button_latch_inst.DEBOUNCE_CYCLES = SIM_DEBOUNCE_CYCLES;
-    defparam dut.button_latch_inst.LATCH_CYCLES    = SIM_LATCH_CYCLES;
-    defparam dut.tx_fsm_inst.DELAY_1_CYCLES        = SIM_DELAY_1_CYCLES;
-    defparam dut.tx_fsm_inst.DELAY_2_CYCLES        = SIM_DELAY_2_CYCLES;
-    defparam dut.tx_fsm_inst.DELAY_3_CYCLES        = SIM_DELAY_3_CYCLES;
-    defparam dut.seven_seg_inst.DIGIT_PERIOD       = SIM_DIGIT_PERIOD;
+    // Scale ONLY the button latch (otherwise BTNC presses would burn 1 s of sim).
+    // All baud-related parameters stay at their real values so the RX/TX waveforms
+    // exactly match the board.
+    defparam dut.button_latch_inst.DEBOUNCE_CYCLES = 4;
+    defparam dut.button_latch_inst.LATCH_CYCLES    = 16;
 
+    // -------------------------------------------------------------------------
+    // Clock
+    // -------------------------------------------------------------------------
+    initial clk = 1'b0;
     always #(CLK_PERIOD_NS / 2) clk = ~clk;
 
-    // ----------------------------------------------------------------
-    // Common tasks
-    // ----------------------------------------------------------------
-    task automatic reset_dut();
+    // -------------------------------------------------------------------------
+    // PASS/FAIL counters + background event monitors
+    // -------------------------------------------------------------------------
+    int checks_total = 0;
+    int checks_pass  = 0;
+    int checks_fail  = 0;
+
+    int rx_valid_events;
+    int rx_error_events;
+    int tx_start_edges;
+    int tx_led_rises;
+
+    logic prev_uart_tx;
+    logic prev_led0;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_valid_events <= 0;
+            rx_error_events <= 0;
+            tx_start_edges  <= 0;
+            tx_led_rises    <= 0;
+            prev_uart_tx    <= 1'b1;
+            prev_led0       <= 1'b0;
+        end else begin
+            if (dut.rx_msg_valid) rx_valid_events <= rx_valid_events + 1;
+            if (dut.rx_msg_error) rx_error_events <= rx_error_events + 1;
+
+            if (prev_uart_tx && !uart_tx) tx_start_edges <= tx_start_edges + 1;
+            prev_uart_tx <= uart_tx;
+
+            if (!prev_led0 && led[0]) tx_led_rises <= tx_led_rises + 1;
+            prev_led0 <= led[0];
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Helper tasks
+    // -------------------------------------------------------------------------
+    task automatic test_start(input string name);
+        $display("\n------------------------------------------------------------");
+        $display("[TEST] %s", name);
+        $display("------------------------------------------------------------");
+    endtask
+
+    task automatic info(input string msg);
+        $display("INFO  %s", msg);
+    endtask
+
+    task automatic check(input string msg, input bit condition);
+        checks_total++;
+        if (condition) begin
+            checks_pass++;
+            $display("PASS  %s", msg);
+        end else begin
+            checks_fail++;
+            $display("FAIL  %s", msg);
+        end
+    endtask
+
+    function automatic string printable_char(input logic [7:0] c);
+        if (c >= 8'h20 && c <= 8'h7E) printable_char = $sformatf("%c", c);
+        else if (c == 8'h0A)          printable_char = "LF";
+        else if (c == 8'h0D)          printable_char = "CR";
+        else                          printable_char = ".";
+    endfunction
+
+    task automatic tick(input int n);
+        repeat (n) @(posedge clk);
+    endtask
+
+    task automatic apply_reset;
         begin
-            clk        = 1'b0;
             rst_n      = 1'b0;
-            sw         = '0;
             center_btn = 1'b0;
-            rx_in_drv  = 1'b1;            // UART line idles high
-            repeat (4) @(posedge clk);
+            sw         = 16'h0000;
+            rx_in_drv  = 1'b1;
+            tick(20);
             rst_n = 1'b1;
-            repeat (2) @(posedge clk);
+            tick(20);
         end
     endtask
 
-    // Drive BTNC long enough for the button_latch to fire. Hold until the
-    // pulse is observed, then release. Adds a small cooldown so the next
-    // call sees a clean rising edge on center_btn.
-    task automatic latch_configuration(input logic [15:0] new_sw);
+    task automatic set_tx_mode;
         begin
-            sw = new_sw;
-            @(posedge clk);
+            sw[15] = 1'b0;
+            tick(5);
+        end
+    endtask
+
+    task automatic set_rx_mode;
+        begin
+            sw[15] = 1'b1;
+            tick(5);
+        end
+    endtask
+
+    // -------------------------------------------------------------------------
+    // RX serial driver - drives the external PC->FPGA UART input.
+    // -------------------------------------------------------------------------
+    task automatic send_rx_byte(input logic [7:0] data, input bit good_stop = 1'b1);
+        begin
+            rx_in_drv = 1'b1;
+            tick(2);
+
+            rx_in_drv = 1'b0;            // start bit
+            tick(UART_BIT_CYCLES);
+
+            for (int i = 0; i < 8; i++) begin
+                rx_in_drv = data[i];     // LSB first
+                tick(UART_BIT_CYCLES);
+            end
+
+            rx_in_drv = good_stop;       // stop bit
+            tick(UART_BIT_CYCLES);
+            rx_in_drv = 1'b1;
+        end
+    endtask
+
+    task automatic send_rx_string(input string pkt);
+        logic [7:0] ch;
+        begin
+            $display("INFO  Sending RX string: %s", pkt);
+            for (int i = 0; i < pkt.len(); i++) begin
+                ch = pkt.getc(i);
+                send_rx_byte(ch, 1'b1);
+            end
+            tick(20);
+        end
+    endtask
+
+    task automatic wait_parser_result(
+        output bit got_valid,
+        output bit got_error,
+        input  int timeout_cycles = RX_RESULT_TIMEOUT
+    );
+        begin
+            got_valid = 1'b0;
+            got_error = 1'b0;
+            for (int i = 0; i < timeout_cycles; i++) begin
+                @(posedge clk);
+                if (dut.rx_msg_valid) begin got_valid = 1'b1; return; end
+                if (dut.rx_msg_error) begin got_error = 1'b1; return; end
+            end
+        end
+    endtask
+
+    // -------------------------------------------------------------------------
+    // TX helpers
+    // -------------------------------------------------------------------------
+    task automatic press_button_long_enough;
+        begin
+            info($sformatf("Pressing BTNC for %0d clock cycles", BTN_HOLD_CYCLES));
             center_btn = 1'b1;
-            wait (dut.latch_triggered === 1'b1);
-            @(posedge clk);
+            tick(BTN_HOLD_CYCLES);
             center_btn = 1'b0;
-            repeat (SIM_DEBOUNCE_CYCLES + 4) @(posedge clk);
+            tick(20);
         end
     endtask
 
-    // Sample uart_tx at every TX baud_pulse, picking up one received UART byte.
-    task automatic receive_uart_byte(output byte value);
+    task automatic receive_tx_byte(
+        output bit          ok,
+        output logic [7:0]  data,
+        input  int          timeout_cycles = TX_START_TIMEOUT
+    );
+        int wait_count;
         begin
-            value = 8'h00;
-            @(negedge uart_tx);
-            for (int bit_index = 0; bit_index < 8; bit_index++) begin
-                @(posedge dut.baud_pulse);
-                value[bit_index] = uart_tx;
+            ok   = 1'b0;
+            data = 8'h00;
+
+            // Wait for falling start bit on uart_tx.
+            wait_count = 0;
+            while (uart_tx !== 1'b0 && wait_count < timeout_cycles) begin
+                @(posedge clk);
+                wait_count++;
             end
-            @(posedge dut.baud_pulse);
-            if (uart_tx !== 1'b1)
-                $error("UART stop bit was not high");
+
+            if (wait_count >= timeout_cycles) return;
+
+            // Step to middle of bit 0.
+            tick(UART_BIT_CYCLES + HALF_BIT_CYCLES);
+
+            for (int i = 0; i < 8; i++) begin
+                data[i] = uart_tx;
+                tick(UART_BIT_CYCLES);
+            end
+
+            // Stop bit should be high one bit later.
+            ok = (uart_tx === 1'b1);
+            tick(HALF_BIT_CYCLES);
         end
     endtask
 
-    task automatic expect_equal_byte(
-        input byte    actual_value,
-        input byte    expected_value,
-        input string  label
+    task automatic wait_tx_idle(
+        output bit idle_ok,
+        input  int timeout_cycles = TX_IDLE_TIMEOUT
     );
         begin
-            if (actual_value !== expected_value)
-                $error("%s mismatch. expected=0x%02h actual=0x%02h",
-                       label, expected_value, actual_value);
-            else
-                $display("[TB] %s ok: 0x%02h", label, actual_value);
-        end
-    endtask
-
-    task automatic expect_equal_byte_quiet(
-        input byte    actual_value,
-        input byte    expected_value,
-        input string  label,
-        input int     index
-    );
-        begin
-            if (actual_value !== expected_value)
-                $error("%s[%0d] mismatch. expected=0x%02h actual=0x%02h",
-                       label, index, expected_value, actual_value);
-        end
-    endtask
-
-    // Bit-bang an ASCII string onto rx_in_drv.
-    //   For each character: 1 start bit (0), 8 data bits LSB first, 1 stop bit (1).
-    //   Each bit lasts SIM_BAUD_DIVISOR system-clock cycles.
-    task automatic drive_rx_message(input string s);
-        byte ch;
-        begin
-            for (int i = 0; i < s.len(); i++) begin
-                ch = s[i];
-                // start bit
-                rx_in_drv = 1'b0;
-                repeat (SIM_BAUD_DIVISOR) @(posedge clk);
-                // 8 data bits LSB first
-                for (int b = 0; b < 8; b++) begin
-                    rx_in_drv = ch[b];
-                    repeat (SIM_BAUD_DIVISOR) @(posedge clk);
+            idle_ok = 1'b0;
+            for (int i = 0; i < timeout_cycles; i++) begin
+                @(posedge clk);
+                // IDLE in our FSM enum = 3'd0
+                if (uart_tx === 1'b1 && dut.tx_fsm_inst.state == 3'd0) begin
+                    idle_ok = 1'b1;
+                    return;
                 end
-                // stop bit
-                rx_in_drv = 1'b1;
-                repeat (SIM_BAUD_DIVISOR) @(posedge clk);
             end
         end
     endtask
 
-    // ----------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Main test sequence
-    // ----------------------------------------------------------------
+    // -------------------------------------------------------------------------
     initial begin
-        $dumpfile("trx_uart_controller_tb.vcd");
-        $dumpvars(0, trx_uart_controller_tb);
+        bit          got_valid;
+        bit          got_error;
+        bit          tx_ok;
+        bit          idle_ok;
+        logic [7:0]  tx_b0, tx_b1, tx_b2, tx_b3;
+        int          v_before, e_before, tx_edges_before, led_rises_before;
 
-        reset_dut();
+        $display("============================================================");
+        $display("Lab 5 - trx_uart_controller full-system testbench");
+        $display("============================================================");
 
-        // ================================================================
-        // Scenario 1: TX 1x1 mode (Lab 4 regression)
-        //   sw[15]=0, size=00, speed=00, data=0xA5
-        // ================================================================
-        $display("\n[TB] === Scenario 1: TX 1x1 mode ===");
-        latch_configuration(16'b0_00_000_00_10100101);
+        apply_reset();
 
-        if (dut.num_bytes_to_send !== 17'd1)
-            $error("[1x1] expected num_bytes_to_send=1, got %0d", dut.num_bytes_to_send);
+        // ---------------------------------------------------------------------
+        test_start("1. Reset behaviour");
+        check("UART TX output idles high after reset",       uart_tx === 1'b1);
+        check("LED[0] (TX activity) is low after reset",     led[0]  === 1'b0);
+        check("LED[15] mirrors sw[15] after reset",          led[15] === sw[15]);
+        check("RX row output resets to 0",                   dut.rx_row_val   === 8'd0);
+        check("RX column output resets to 0",                dut.rx_col_val   === 8'd0);
+        check("RX pixel output resets to 0",                 dut.rx_pixel_val === 8'd0);
 
-        receive_uart_byte(rx_byte);
-        expect_equal_byte(rx_byte, 8'hA5, "1x1 data byte");
+        // ---------------------------------------------------------------------
+        test_start("2. TX mode blocks the RX path");
+        set_tx_mode();
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{R012,C034,V056}");
+        tick(RX_RESULT_TIMEOUT);
+        check("No RX valid pulse while sw[15]=0", rx_valid_events == v_before);
+        check("No RX error pulse while sw[15]=0", rx_error_events == e_before);
+        check("RX row preserved in TX mode",      dut.rx_row_val   === 8'd0);
+        check("RX col preserved in TX mode",      dut.rx_col_val   === 8'd0);
+        check("RX pixel preserved in TX mode",    dut.rx_pixel_val === 8'd0);
 
-        receive_uart_byte(delimiter_byte);
-        expect_equal_byte(delimiter_byte, 8'h20, "1x1 delimiter byte");
+        // ---------------------------------------------------------------------
+        test_start("3. Valid RX packet updates outputs");
+        set_rx_mode();
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{R012,C034,V056}");
+        tick(100);
+        check("Parser asserted msg_valid for valid packet",  rx_valid_events > v_before);
+        check("Parser did not assert msg_error",             rx_error_events == e_before);
+        check("RX row updated to 12",                         dut.rx_row_val   === 8'd12);
+        check("RX col updated to 34",                         dut.rx_col_val   === 8'd34);
+        check("RX pixel updated to 56",                       dut.rx_pixel_val === 8'd56);
 
-        if (led[0] !== 1'b1)
-            $error("[1x1] LED[0] did not toggle after first data byte");
-        if (led[15] !== 1'b0)
-            $error("[1x1] LED[15] should be 0 in TX mode, got %b", led[15]);
+        // ---------------------------------------------------------------------
+        test_start("4. RX range safety rejects value above 255");
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{R256,C034,V056}");
+        tick(100);
+        check("Parser asserted msg_error for R256",          rx_error_events > e_before);
+        check("Parser did not assert msg_valid",             rx_valid_events == v_before);
+        check("RX row preserved after range error",          dut.rx_row_val   === 8'd12);
+        check("RX col preserved after range error",          dut.rx_col_val   === 8'd34);
+        check("RX pixel preserved after range error",        dut.rx_pixel_val === 8'd56);
 
-        wait (dut.transmission_done === 1'b1);
-        @(posedge clk);
+        // ---------------------------------------------------------------------
+        test_start("5. RX syntax safety rejects wrong header");
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{X012,C034,V056}");
+        tick(100);
+        check("Parser asserted msg_error for wrong R header", rx_error_events > e_before);
+        check("Parser did not assert msg_valid",              rx_valid_events == v_before);
+        check("RX outputs preserved after syntax error",
+              dut.rx_row_val   === 8'd12 &&
+              dut.rx_col_val   === 8'd34 &&
+              dut.rx_pixel_val === 8'd56);
 
-        if (dut.t0_data !== 8'hA5) $error("[1x1] T0 expected 0xA5 got 0x%02h", dut.t0_data);
-        if (dut.t1_data !== 8'h00) $error("[1x1] T1 expected 0x00 got 0x%02h", dut.t1_data);
-        if (dut.t2_data !== 8'h01) $error("[1x1] T2 expected 0x01 got 0x%02h", dut.t2_data);
-        if (dut.t3_data !== 8'h01) $error("[1x1] T3 expected 0x01 got 0x%02h", dut.t3_data);
+        // ---------------------------------------------------------------------
+        test_start("6. RX digit safety rejects non-digit character");
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{R12A,C034,V056}");
+        tick(100);
+        check("Parser asserted msg_error for non-digit row",  rx_error_events > e_before);
+        check("Parser did not assert msg_valid",              rx_valid_events == v_before);
+        check("RX outputs preserved after non-digit error",
+              dut.rx_row_val   === 8'd12 &&
+              dut.rx_col_val   === 8'd34 &&
+              dut.rx_pixel_val === 8'd56);
 
-        // ================================================================
-        // Scenario 2: TX 32x32 mode (Lab 4 regression)
-        //   sw[15]=0, size=01, speed=00, data=0x5A
-        // ================================================================
-        $display("\n[TB] === Scenario 2: TX 32x32 mode ===");
-        latch_configuration(16'b0_01_000_00_01011010);
+        // ---------------------------------------------------------------------
+        test_start("7. RX MAC framing rejects missing closing brace");
+        v_before = rx_valid_events;
+        e_before = rx_error_events;
+        send_rx_string("{R012,C034,V056!");
+        tick(RX_RESULT_TIMEOUT);
+        check("No parser valid event (MAC drops frame before parser)",
+              rx_valid_events == v_before);
+        check("No parser error event (MAC drops frame before parser)",
+              rx_error_events == e_before);
+        check("RX outputs preserved after MAC drop",
+              dut.rx_row_val   === 8'd12 &&
+              dut.rx_col_val   === 8'd34 &&
+              dut.rx_pixel_val === 8'd56);
 
-        if (dut.num_bytes_to_send !== 17'd1024)
-            $error("[32x32] expected num_bytes_to_send=1024, got %0d", dut.num_bytes_to_send);
+        // ---------------------------------------------------------------------
+        test_start("8. RX MAC active resynchronization");
+        info("Sending partial frame then a fresh valid one");
+        v_before = rx_valid_events;
+        send_rx_string("{R999,");
+        send_rx_string("{R001,C002,V003}");
+        tick(100);
+        check("Parser asserted msg_valid after resync",       rx_valid_events > v_before);
+        check("RX row after resync is 1",                     dut.rx_row_val   === 8'd1);
+        check("RX col after resync is 2",                     dut.rx_col_val   === 8'd2);
+        check("RX pixel after resync is 3",                   dut.rx_pixel_val === 8'd3);
 
-        for (int row = 0; row < 32; row++) begin
-            for (int col = 0; col < 32; col++) begin
-                receive_uart_byte(rx_byte);
-                expect_equal_byte_quiet(rx_byte, 8'h5A, "32x32 data",  row * 32 + col);
-                receive_uart_byte(rx_byte);
-                expect_equal_byte_quiet(rx_byte, 8'h20, "32x32 delim", row * 32 + col);
+        // Also check display mux now shows RX fields
+        check("Display T0 reflects rx_pixel_val (RX mode)",  dut.t0_data === 8'd3);
+        check("Display T2 reflects rx_col_val (RX mode)",    dut.t2_data === 8'd2);
+        check("Display T3 reflects rx_row_val (RX mode)",    dut.t3_data === 8'd1);
+        check("Display dash_enable lit on T1 in RX mode",    dut.dash_enable === 8'b0000_1100);
+
+        // ---------------------------------------------------------------------
+        test_start("9. RX mode blocks the TX button");
+        set_rx_mode();
+        tx_edges_before = tx_start_edges;
+        press_button_long_enough();
+        tick(TX_START_TIMEOUT);
+        check("No TX UART start edge while sw[15]=1", tx_start_edges == tx_edges_before);
+        check("UART output stays idle high in RX mode", uart_tx === 1'b1);
+        check("LED[0] (TX activity) stays low in RX mode", led[0]  === 1'b0);
+
+        // ---------------------------------------------------------------------
+        test_start("10. TX minimum sequence (1x1 'X', no inter-byte delay)");
+        apply_reset();
+        set_tx_mode();
+        sw[7:0]   = 8'h58;          // 'X'
+        sw[9:8]   = 2'b00;          // speed 0
+        sw[14:13] = 2'b00;          // size 0 -> 1x1
+        tick(10);
+
+        led_rises_before = tx_led_rises;
+
+        fork
+            begin
+                press_button_long_enough();
             end
-            receive_uart_byte(rx_byte);
-            expect_equal_byte_quiet(rx_byte, 8'h0D, "32x32 cr", row);
-            receive_uart_byte(rx_byte);
-            expect_equal_byte_quiet(rx_byte, 8'h0A, "32x32 lf", row);
-        end
+            begin
+                receive_tx_byte(tx_ok, tx_b0);
+                check("TX byte 0 received", tx_ok);
+                $display("INFO  TX byte 0 = 0x%02h '%s'", tx_b0, printable_char(tx_b0));
 
-        wait (dut.transmission_done === 1'b1);
-        @(posedge clk);
+                receive_tx_byte(tx_ok, tx_b1);
+                check("TX byte 1 received", tx_ok);
+                $display("INFO  TX byte 1 = 0x%02h '%s'", tx_b1, printable_char(tx_b1));
 
-        if (dut.row_count !== 8'd32)
-            $error("[32x32] expected row_count=32 got %0d", dut.row_count);
-        if (dut.t3_data !== 8'h20)
-            $error("[32x32] T3 expected 0x20 got 0x%02h", dut.t3_data);
+                receive_tx_byte(tx_ok, tx_b2);
+                check("TX byte 2 received", tx_ok);
+                $display("INFO  TX byte 2 = 0x%02h '%s'", tx_b2, printable_char(tx_b2));
 
-        // ================================================================
-        // Scenario 3: TX is gated off in RX mode
-        //   Set sw[15]=1, hold BTNC longer than the latch threshold,
-        //   verify latch_triggered never fires and uart_tx stays idle.
-        // ================================================================
-        $display("\n[TB] === Scenario 3: TX gated in RX mode ===");
-        sw = 16'b1_00_000_00_00000000;
-        @(posedge clk);
+                receive_tx_byte(tx_ok, tx_b3);
+                check("TX byte 3 received", tx_ok);
+                $display("INFO  TX byte 3 = 0x%02h '%s'", tx_b3, printable_char(tx_b3));
+            end
+        join
 
-        if (led[15] !== 1'b1)
-            $error("[RX gate] LED[15] expected 1 (RX mode) got %b", led[15]);
+        check("TX byte 0 is data 'X' (0x58)", tx_b0 === 8'h58);
+        check("TX byte 1 is space (0x20)",    tx_b1 === 8'h20);
+        check("TX byte 2 is CR (0x0D)",       tx_b2 === 8'h0D);
+        check("TX byte 3 is LF (0x0A)",       tx_b3 === 8'h0A);
 
-        center_btn = 1'b1;
-        repeat (SIM_DEBOUNCE_CYCLES + SIM_LATCH_CYCLES + 50) @(posedge clk);
+        wait_tx_idle(idle_ok);
+        check("TX returned to IDLE state",                idle_ok);
+        check("UART output idle high after TX completion", uart_tx === 1'b1);
+        check("LED[0] toggled during transmission",       tx_led_rises > led_rises_before);
+        check("Display T3 shows row count = 1",            dut.t3_data === 8'h01);
 
-        if (dut.latch_triggered === 1'b1)
-            $error("[RX gate] latch_triggered fired while sw[15]=1");
-        if (uart_tx !== 1'b1)
-            $error("[RX gate] uart_tx left idle while sw[15]=1");
+        // ---------------------------------------------------------------------
+        test_start("11. Mode indicator LED[15]");
+        sw[15] = 1'b0; tick(3);
+        check("LED[15] is 0 in TX mode", led[15] === 1'b0);
+        sw[15] = 1'b1; tick(3);
+        check("LED[15] is 1 in RX mode", led[15] === 1'b1);
 
-        center_btn = 1'b0;
-        repeat (SIM_DEBOUNCE_CYCLES + 4) @(posedge clk);
+        // ---------------------------------------------------------------------
+        $display("\n============================================================");
+        $display("TEST SUMMARY");
+        $display("  Total checks : %0d", checks_total);
+        $display("  Passed       : %0d", checks_pass);
+        $display("  Failed       : %0d", checks_fail);
+        if (checks_fail == 0)
+            $display("  RESULT       : PASS");
+        else
+            $display("  RESULT       : FAIL");
+        $display("============================================================");
 
-        // ================================================================
-        // Scenario 4: RX happy path - "{R032,C016,V255}"
-        //   sw[15]=1 already from scenario 3.
-        // ================================================================
-        $display("\n[TB] === Scenario 4: RX happy path ===");
-        drive_rx_message("{R032,C016,V255}");
-
-        // Give the MAC + parser a few cycles to settle after the last byte's stop.
-        repeat (200) @(posedge clk);
-
-        if (dut.rx_row_val   !== 8'd32)
-            $error("[RX happy] row_val expected 32 got %0d",   dut.rx_row_val);
-        if (dut.rx_col_val   !== 8'd16)
-            $error("[RX happy] col_val expected 16 got %0d",   dut.rx_col_val);
-        if (dut.rx_pixel_val !== 8'd255)
-            $error("[RX happy] pixel_val expected 255 got %0d", dut.rx_pixel_val);
-
-        // Display mux must now show the RX fields
-        if (dut.t0_data !== 8'd255)
-            $error("[RX happy] t0_data expected 0xFF got 0x%02h", dut.t0_data);
-        if (dut.t2_data !== 8'd16)
-            $error("[RX happy] t2_data expected 0x10 got 0x%02h", dut.t2_data);
-        if (dut.t3_data !== 8'd32)
-            $error("[RX happy] t3_data expected 0x20 got 0x%02h", dut.t3_data);
-        if (dut.dash_enable !== 8'b0000_1100)
-            $error("[RX happy] dash_enable expected 0x0C got 0x%02h", dut.dash_enable);
-
-        $display("[TB] RX happy path passed");
-
-        // ================================================================
-        // Scenario 5: RX malformed - "{R032,X016,V255}"
-        //   'X' in the comma slot must cause the parser to reject the
-        //   message; row_val/col_val/pixel_val must not change.
-        // ================================================================
-        $display("\n[TB] === Scenario 5: RX malformed ===");
-        drive_rx_message("{R032,X016,V255}");
-
-        repeat (200) @(posedge clk);
-
-        // Outputs must still hold the scenario-4 values.
-        if (dut.rx_row_val   !== 8'd32)
-            $error("[RX bad] row_val changed (now %0d)",   dut.rx_row_val);
-        if (dut.rx_col_val   !== 8'd16)
-            $error("[RX bad] col_val changed (now %0d)",   dut.rx_col_val);
-        if (dut.rx_pixel_val !== 8'd255)
-            $error("[RX bad] pixel_val changed (now %0d)", dut.rx_pixel_val);
-
-        $display("[TB] RX malformed path passed");
-
-        $display("\n[TB] === All 5 scenarios complete ===");
+        #1000;
         $finish;
     end
 
